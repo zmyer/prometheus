@@ -344,6 +344,14 @@ func (s *targetScraper) scrape(ctx context.Context, ts time.Time) (model.Samples
 		}
 		allSamples = append(allSamples, decSamples...)
 		decSamples = decSamples[:0]
+
+		// If we timeout during decoding we discard the entire set of samples
+		// as partial scrapes are not generally correct.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 	}
 
 	if err == io.EOF {
