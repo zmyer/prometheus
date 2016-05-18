@@ -71,6 +71,22 @@ func init() {
 	)
 
 	// Web.
+	cfg.fs.BoolVar(
+		&cfg.web.DisableAuth, "web.disable-auth", false,
+		"Disable authentication of API endpoints",
+	)
+	cfg.fs.StringVar(
+		&cfg.web.AuthClientID, "",
+		"The OIDC OAuth2 Client ID.",
+	)
+	cfg.fs.StringVar(
+		&cfg.web.AuthClientSecret, "",
+		"The OIDC/OAuth2 Client Secret.",
+	)
+	cfg.fs.StringVar(
+		&cfg.web.AuthIssuerURL, "",
+		"The OIDC/OAuth2 issuer URL.",
+	)
 	cfg.fs.StringVar(
 		&cfg.web.ListenAddress, "web.listen-address", ":9090",
 		"Address to listen on for the web interface, API, and telemetry.",

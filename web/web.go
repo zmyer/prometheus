@@ -32,6 +32,7 @@ import (
 	pprof_runtime "runtime/pprof"
 	template_text "text/template"
 
+	"github.com/coreos/go-oidc/oidc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
@@ -47,13 +48,23 @@ import (
 	"github.com/prometheus/prometheus/version"
 	"github.com/prometheus/prometheus/web/api/legacy"
 	"github.com/prometheus/prometheus/web/api/v1"
+	"github.com/prometheus/prometheus/web/auth"
 	"github.com/prometheus/prometheus/web/ui"
 )
 
 var localhostRepresentations = []string{"127.0.0.1", "localhost"}
 
+const (
+	AuthLoginEndpoint         = "/auth/login"
+	AuthLogoutEndpoint        = "/auth/logout"
+	AuthLoginCallbackEndpoint = "/auth/callback"
+	AuthErrorURL              = "/error"
+	AuthSuccessURL            = "/"
+)
+
 // Handler serves various HTTP endpoints of the Prometheus server
 type Handler struct {
+	auther      *auth.Authenticator
 	ruleManager *rules.Manager
 	queryEngine *promql.Engine
 	storage     local.Storage
@@ -120,6 +131,34 @@ type Options struct {
 	ConsoleTemplatesPath string
 	ConsoleLibrariesPath string
 	EnableQuit           bool
+
+	DisableAuth      bool
+	AuthClientID     string
+	AuthClientSecret string
+	AuthIssuerURL    string
+}
+
+// Middleware generates a middleware wrapper for request hanlders.
+// Responds with 401 for requests with missing/invalid/incomplete token with verified email address.
+func authMiddleware(a *auth.Authenticator, hdlr http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		encTok, err := a.TokenExtractor(r)
+		if err != nil {
+			plog.Infof("no token found: %v", err)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		_, err = a.TokenVerifier(encTok)
+		if err != nil {
+			plog.Infof("error verifying token: %v", err)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		r.Header.Set("Authorization", fmt.Sprintf("Bearer %s", encTok))
+		hdlr.ServeHTTP(w, r)
+	}
 }
 
 // New initializes a new web Handler.
@@ -144,6 +183,20 @@ func New(st local.Storage, qe *promql.Engine, rm *rules.Manager, status *Prometh
 			Storage:     st,
 			Now:         model.Now,
 		},
+	}
+
+	ocfg := oidc.ClientConfig{
+		HTTPClient: http.DefaultClient,
+		Credentials: oidc.ClientCredentials{
+			ID:     o.AuthClientID,
+			Secret: o.AuthClientSecret,
+		},
+		RedirectURL: o.ExternalURL.String(),
+	}
+
+	auther, err := auth.NewAuthenticator(ocfg, o.IssuerURL, AuthErrorURL, AuthSuccessURL)
+	if err != nil {
+		panic(err)
 	}
 
 	if o.ExternalURL.Path != "" {
