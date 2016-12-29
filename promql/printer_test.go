@@ -60,6 +60,10 @@ func TestExprString(t *testing.T) {
 		in, out string
 	}{
 		{
+			in:  `sum(task:errors:rate10s{job="s"}) BY ()`,
+			out: `sum(task:errors:rate10s{job="s"})`,
+		},
+		{
 			in: `sum(task:errors:rate10s{job="s"}) BY (code)`,
 		},
 		{
@@ -78,6 +82,9 @@ func TestExprString(t *testing.T) {
 			in: `count_values("value", task:errors:rate10s{job="s"})`,
 		},
 		{
+			in: `a - ON() c`,
+		},
+		{
 			in: `a - ON(b) c`,
 		},
 		{
@@ -87,10 +94,18 @@ func TestExprString(t *testing.T) {
 			in: `a - ON(b) GROUP_LEFT(x, y) c`,
 		},
 		{
-			in: `a - ON(b) GROUP_LEFT c`,
+			in:  `a - ON(b) GROUP_LEFT c`,
+			out: `a - ON(b) GROUP_LEFT() c`,
+		},
+		{
+			in: `a - ON(b) GROUP_LEFT() (c)`,
 		},
 		{
 			in: `a - IGNORING(b) c`,
+		},
+		{
+			in:  `a - IGNORING() c`,
+			out: `a - c`,
 		},
 		{
 			in: `up > BOOL 0`,

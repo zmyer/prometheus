@@ -30,6 +30,18 @@ import (
 	"github.com/prometheus/prometheus/util/stats"
 )
 
+const (
+	// The largest SampleValue that can be converted to an int64 without overflow.
+	maxInt64 model.SampleValue = 9223372036854774784
+	// The smallest SampleValue that can be converted to an int64 without underflow.
+	minInt64 model.SampleValue = -9223372036854775808
+)
+
+// convertibleToInt64 returns true if v does not over-/underflow an int64.
+func convertibleToInt64(v model.SampleValue) bool {
+	return v <= maxInt64 && v >= minInt64
+}
+
 // sampleStream is a stream of Values belonging to an attached COWMetric.
 type sampleStream struct {
 	Metric metric.Metric
@@ -108,7 +120,7 @@ func (r *Result) Matrix() (model.Matrix, error) {
 	}
 	v, ok := r.Value.(model.Matrix)
 	if !ok {
-		return nil, fmt.Errorf("query result is not a matrix")
+		return nil, fmt.Errorf("query result is not a range vector")
 	}
 	return v, nil
 }
@@ -150,7 +162,7 @@ func (e ErrQueryCanceled) Error() string { return fmt.Sprintf("query was cancele
 // it is associated with.
 type Query interface {
 	// Exec processes the query and
-	Exec() *Result
+	Exec(ctx context.Context) *Result
 	// Statement returns the parsed statement of the query.
 	Statement() Statement
 	// Stats returns statistics about the lifetime of the query.
@@ -192,8 +204,8 @@ func (q *query) Cancel() {
 }
 
 // Exec implements the Query interface.
-func (q *query) Exec() *Result {
-	res, err := q.ng.exec(q)
+func (q *query) Exec(ctx context.Context) *Result {
+	res, err := q.ng.exec(ctx, q)
 	return &Result{Err: err, Value: res}
 }
 
@@ -218,30 +230,27 @@ func contextDone(ctx context.Context, env string) error {
 // Engine handles the lifetime of queries from beginning to end.
 // It is connected to a querier.
 type Engine struct {
-	// The querier on which the engine operates.
-	querier local.Querier
-
-	// The base context for all queries and its cancellation function.
-	baseCtx       context.Context
-	cancelQueries func()
+	// A Querier constructor against an underlying storage.
+	queryable Queryable
 	// The gate limiting the maximum number of concurrent and waiting queries.
-	gate *queryGate
-
+	gate    *queryGate
 	options *EngineOptions
 }
 
+// Queryable allows opening a storage querier.
+type Queryable interface {
+	Querier() (local.Querier, error)
+}
+
 // NewEngine returns a new engine.
-func NewEngine(querier local.Querier, o *EngineOptions) *Engine {
+func NewEngine(queryable Queryable, o *EngineOptions) *Engine {
 	if o == nil {
 		o = DefaultEngineOptions
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	return &Engine{
-		querier:       querier,
-		baseCtx:       ctx,
-		cancelQueries: cancel,
-		gate:          newQueryGate(o.MaxConcurrentQueries),
-		options:       o,
+		queryable: queryable,
+		gate:      newQueryGate(o.MaxConcurrentQueries),
+		options:   o,
 	}
 }
 
@@ -255,11 +264,6 @@ type EngineOptions struct {
 var DefaultEngineOptions = &EngineOptions{
 	MaxConcurrentQueries: 20,
 	Timeout:              2 * time.Minute,
-}
-
-// Stop the engine and cancel all running queries.
-func (ng *Engine) Stop() {
-	ng.cancelQueries()
 }
 
 // NewInstantQuery returns an evaluation query for the given expression at the given time.
@@ -282,7 +286,7 @@ func (ng *Engine) NewRangeQuery(qs string, start, end model.Time, interval time.
 		return nil, err
 	}
 	if expr.Type() != model.ValVector && expr.Type() != model.ValScalar {
-		return nil, fmt.Errorf("invalid expression type %q for range query, must be scalar or vector", expr.Type())
+		return nil, fmt.Errorf("invalid expression type %q for range query, must be scalar or instant vector", documentedType(expr.Type()))
 	}
 	qry := ng.newQuery(expr, start, end, interval)
 	qry.q = qs
@@ -326,8 +330,8 @@ func (ng *Engine) newTestQuery(f func(context.Context) error) Query {
 //
 // At this point per query only one EvalStmt is evaluated. Alert and record
 // statements are not handled by the Engine.
-func (ng *Engine) exec(q *query) (model.Value, error) {
-	ctx, cancel := context.WithTimeout(q.ng.baseCtx, ng.options.Timeout)
+func (ng *Engine) exec(ctx context.Context, q *query) (model.Value, error) {
+	ctx, cancel := context.WithTimeout(ctx, ng.options.Timeout)
 	q.cancel = cancel
 
 	queueTimer := q.stats.GetTimer(stats.ExecQueueTime).Start()
@@ -364,13 +368,18 @@ func (ng *Engine) exec(q *query) (model.Value, error) {
 
 // execEvalStmt evaluates the expression of an evaluation statement for the given time range.
 func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *EvalStmt) (model.Value, error) {
+	querier, err := ng.queryable.Querier()
+	if err != nil {
+		return nil, err
+	}
+	defer querier.Close()
+
 	prepareTimer := query.stats.GetTimer(stats.QueryPreparationTime).Start()
-	err := ng.populateIterators(s)
+	err = ng.populateIterators(ctx, querier, s)
 	prepareTimer.Stop()
 	if err != nil {
 		return nil, err
 	}
-
 	defer ng.closeIterators(s)
 
 	evalTimer := query.stats.GetTimer(stats.InnerEvalTime).Start()
@@ -476,45 +485,38 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *EvalStmt) (
 	return resMatrix, nil
 }
 
-func (ng *Engine) populateIterators(s *EvalStmt) error {
+func (ng *Engine) populateIterators(ctx context.Context, querier local.Querier, s *EvalStmt) error {
 	var queryErr error
 	Inspect(s.Expr, func(node Node) bool {
 		switch n := node.(type) {
 		case *VectorSelector:
-			var iterators []local.SeriesIterator
-			var err error
 			if s.Start.Equal(s.End) {
-				iterators, err = ng.querier.QueryInstant(
+				n.iterators, queryErr = querier.QueryInstant(
+					ctx,
 					s.Start.Add(-n.Offset),
 					StalenessDelta,
 					n.LabelMatchers...,
 				)
 			} else {
-				iterators, err = ng.querier.QueryRange(
+				n.iterators, queryErr = querier.QueryRange(
+					ctx,
 					s.Start.Add(-n.Offset-StalenessDelta),
 					s.End.Add(-n.Offset),
 					n.LabelMatchers...,
 				)
 			}
-			if err != nil {
-				queryErr = err
+			if queryErr != nil {
 				return false
 			}
-			for _, it := range iterators {
-				n.iterators = append(n.iterators, it)
-			}
 		case *MatrixSelector:
-			iterators, err := ng.querier.QueryRange(
+			n.iterators, queryErr = querier.QueryRange(
+				ctx,
 				s.Start.Add(-n.Offset-n.Range),
 				s.End.Add(-n.Offset),
 				n.LabelMatchers...,
 			)
-			if err != nil {
-				queryErr = err
+			if queryErr != nil {
 				return false
-			}
-			for _, it := range iterators {
-				n.iterators = append(n.iterators, it)
 			}
 		}
 		return true
@@ -579,7 +581,7 @@ func (ev *evaluator) evalScalar(e Expr) *model.Scalar {
 	val := ev.eval(e)
 	sv, ok := val.(*model.Scalar)
 	if !ok {
-		ev.errorf("expected scalar but got %s", val.Type())
+		ev.errorf("expected scalar but got %s", documentedType(val.Type()))
 	}
 	return sv
 }
@@ -589,15 +591,18 @@ func (ev *evaluator) evalVector(e Expr) vector {
 	val := ev.eval(e)
 	vec, ok := val.(vector)
 	if !ok {
-		ev.errorf("expected vector but got %s", val.Type())
+		ev.errorf("expected instant vector but got %s", documentedType(val.Type()))
 	}
 	return vec
 }
 
 // evalInt attempts to evaluate e into an integer and errors otherwise.
-func (ev *evaluator) evalInt(e Expr) int {
+func (ev *evaluator) evalInt(e Expr) int64 {
 	sc := ev.evalScalar(e)
-	return int(sc.Value)
+	if !convertibleToInt64(sc.Value) {
+		ev.errorf("scalar value %v overflows int64", sc.Value)
+	}
+	return int64(sc.Value)
 }
 
 // evalFloat attempts to evaluate e into a float and errors otherwise.
@@ -607,11 +612,13 @@ func (ev *evaluator) evalFloat(e Expr) float64 {
 }
 
 // evalMatrix attempts to evaluate e into a matrix and errors otherwise.
+// The error message uses the term "range vector" to match the user facing
+// documentation.
 func (ev *evaluator) evalMatrix(e Expr) matrix {
 	val := ev.eval(e)
 	mat, ok := val.(matrix)
 	if !ok {
-		ev.errorf("expected matrix but got %s", val.Type())
+		ev.errorf("expected range vector but got %s", documentedType(val.Type()))
 	}
 	return mat
 }
@@ -621,7 +628,7 @@ func (ev *evaluator) evalString(e Expr) *model.String {
 	val := ev.eval(e)
 	sv, ok := val.(*model.String)
 	if !ok {
-		ev.errorf("expected string but got %s", val.Type())
+		ev.errorf("expected string but got %s", documentedType(val.Type()))
 	}
 	return sv
 }
@@ -630,7 +637,7 @@ func (ev *evaluator) evalString(e Expr) *model.String {
 func (ev *evaluator) evalOneOf(e Expr, t1, t2 model.ValueType) model.Value {
 	val := ev.eval(e)
 	if val.Type() != t1 && val.Type() != t2 {
-		ev.errorf("expected %s or %s but got %s", t1, t2, val.Type())
+		ev.errorf("expected %s or %s but got %s", documentedType(t1), documentedType(t2), documentedType(val.Type()))
 	}
 	return val
 }
@@ -1032,10 +1039,7 @@ func scalarBinop(op itemType, lhs, rhs model.SampleValue) model.SampleValue {
 	case itemPOW:
 		return model.SampleValue(math.Pow(float64(lhs), float64(rhs)))
 	case itemMOD:
-		if rhs != 0 {
-			return model.SampleValue(int(lhs) % int(rhs))
-		}
-		return model.SampleValue(math.NaN())
+		return model.SampleValue(math.Mod(float64(lhs), float64(rhs)))
 	case itemEQL:
 		return btos(lhs == rhs)
 	case itemNEQ:
@@ -1066,10 +1070,7 @@ func vectorElemBinop(op itemType, lhs, rhs model.SampleValue) (model.SampleValue
 	case itemPOW:
 		return model.SampleValue(math.Pow(float64(lhs), float64(rhs))), true
 	case itemMOD:
-		if rhs != 0 {
-			return model.SampleValue(int(lhs) % int(rhs)), true
-		}
-		return model.SampleValue(math.NaN()), true
+		return model.SampleValue(math.Mod(float64(lhs), float64(rhs))), true
 	case itemEQL:
 		return lhs, lhs == rhs
 	case itemNEQ:
@@ -1109,7 +1110,7 @@ type groupedAggregation struct {
 func (ev *evaluator) aggregation(op itemType, grouping model.LabelNames, without bool, keepCommon bool, param Expr, vec vector) vector {
 
 	result := map[uint64]*groupedAggregation{}
-	var k int
+	var k int64
 	if op == itemTopK || op == itemBottomK {
 		k = ev.evalInt(param)
 		if k < 1 {
@@ -1212,15 +1213,15 @@ func (ev *evaluator) aggregation(op itemType, grouping model.LabelNames, without
 			groupedResult.valuesSquaredSum += s.Value * s.Value
 			groupedResult.groupCount++
 		case itemTopK:
-			if len(groupedResult.heap) < k || groupedResult.heap[0].Value < s.Value || math.IsNaN(float64(groupedResult.heap[0].Value)) {
-				if len(groupedResult.heap) == k {
+			if int64(len(groupedResult.heap)) < k || groupedResult.heap[0].Value < s.Value || math.IsNaN(float64(groupedResult.heap[0].Value)) {
+				if int64(len(groupedResult.heap)) == k {
 					heap.Pop(&groupedResult.heap)
 				}
 				heap.Push(&groupedResult.heap, &sample{Value: s.Value, Metric: s.Metric})
 			}
 		case itemBottomK:
-			if len(groupedResult.reverseHeap) < k || groupedResult.reverseHeap[0].Value > s.Value || math.IsNaN(float64(groupedResult.reverseHeap[0].Value)) {
-				if len(groupedResult.reverseHeap) == k {
+			if int64(len(groupedResult.reverseHeap)) < k || groupedResult.reverseHeap[0].Value > s.Value || math.IsNaN(float64(groupedResult.reverseHeap[0].Value)) {
+				if int64(len(groupedResult.reverseHeap)) == k {
 					heap.Pop(&groupedResult.reverseHeap)
 				}
 				heap.Push(&groupedResult.reverseHeap, &sample{Value: s.Value, Metric: s.Metric})
@@ -1336,5 +1337,18 @@ func (g *queryGate) Done() {
 	case <-g.ch:
 	default:
 		panic("engine.queryGate.Done: more operations done than started")
+	}
+}
+
+// documentedType returns the internal type to the equivalent
+// user facing terminology as defined in the documentation.
+func documentedType(t model.ValueType) string {
+	switch t.String() {
+	case "vector":
+		return "instant vector"
+	case "matrix":
+		return "range vector"
+	default:
+		return t.String()
 	}
 }

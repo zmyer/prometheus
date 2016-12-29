@@ -237,11 +237,11 @@ var testExpr = []struct {
 	}, {
 		input:  `-"string"`,
 		fail:   true,
-		errMsg: `unary expression only allowed on expressions of type scalar or vector, got "string"`,
+		errMsg: `unary expression only allowed on expressions of type scalar or instant vector, got "string"`,
 	}, {
 		input:  `-test[5m]`,
 		fail:   true,
-		errMsg: `unary expression only allowed on expressions of type scalar or vector, got "matrix"`,
+		errMsg: `unary expression only allowed on expressions of type scalar or instant vector, got "range vector"`,
 	}, {
 		input:  `*test`,
 		fail:   true,
@@ -772,11 +772,11 @@ var testExpr = []struct {
 	}, {
 		input:  "1 or on(bar) foo",
 		fail:   true,
-		errMsg: "vector matching only allowed between vectors",
+		errMsg: "vector matching only allowed between instant vectors",
 	}, {
 		input:  "foo == on(bar) 10",
 		fail:   true,
-		errMsg: "vector matching only allowed between vectors",
+		errMsg: "vector matching only allowed between instant vectors",
 	}, {
 		input:  "foo and on(bar) group_left(baz) bar",
 		fail:   true,
@@ -1226,6 +1226,24 @@ var testExpr = []struct {
 			Param: &StringLiteral{"value"},
 		},
 	}, {
+		// Test usage of keywords as label names.
+		input: "sum without(and, by, avg, count, alert, annotations)(some_metric)",
+		expected: &AggregateExpr{
+			Op:      itemSum,
+			Without: true,
+			Expr: &VectorSelector{
+				Name: "some_metric",
+				LabelMatchers: metric.LabelMatchers{
+					mustLabelMatcher(metric.Equal, model.MetricNameLabel, "some_metric"),
+				},
+			},
+			Grouping: model.LabelNames{"and", "by", "avg", "count", "alert", "annotations"},
+		},
+	}, {
+		input:  "sum without(==)(some_metric)",
+		fail:   true,
+		errMsg: "unexpected <op:==> in grouping opts, expected label",
+	}, {
 		input:  `sum some_metric by (test)`,
 		fail:   true,
 		errMsg: "unexpected identifier \"some_metric\" in aggregation, expected \"(\"",
@@ -1268,7 +1286,7 @@ var testExpr = []struct {
 	}, {
 		input:  `topk(some_metric, other_metric)`,
 		fail:   true,
-		errMsg: "parse error at char 32: expected type scalar in aggregation parameter, got vector",
+		errMsg: "parse error at char 32: expected type scalar in aggregation parameter, got instant vector",
 	}, {
 		input:  `count_values(5, other_metric)`,
 		fail:   true,
@@ -1346,15 +1364,15 @@ var testExpr = []struct {
 	}, {
 		input:  "floor(1)",
 		fail:   true,
-		errMsg: "expected type vector in call to function \"floor\", got scalar",
+		errMsg: "expected type instant vector in call to function \"floor\", got scalar",
 	}, {
-		input:  "non_existant_function_far_bar()",
+		input:  "non_existent_function_far_bar()",
 		fail:   true,
-		errMsg: "unknown function with name \"non_existant_function_far_bar\"",
+		errMsg: "unknown function with name \"non_existent_function_far_bar\"",
 	}, {
 		input:  "rate(some_metric)",
 		fail:   true,
-		errMsg: "expected type matrix in call to function \"rate\", got vector",
+		errMsg: "expected type range vector in call to function \"rate\", got instant vector",
 	},
 	// Fuzzing regression tests.
 	{

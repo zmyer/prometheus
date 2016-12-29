@@ -36,8 +36,11 @@ import (
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
+	"golang.org/x/net/context"
+	"golang.org/x/net/netutil"
 
 	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/retrieval"
 	"github.com/prometheus/prometheus/rules"
@@ -55,7 +58,9 @@ type Handler struct {
 	targetManager *retrieval.TargetManager
 	ruleManager   *rules.Manager
 	queryEngine   *promql.Engine
+	context       context.Context
 	storage       local.Storage
+	notifier      *notifier.Notifier
 
 	apiV1 *api_v1.API
 
@@ -67,10 +72,12 @@ type Handler struct {
 	configString string
 	versionInfo  *PrometheusVersion
 	birth        time.Time
+	cwd          string
 	flagsMap     map[string]string
 
 	externalLabels model.LabelSet
 	mtx            sync.RWMutex
+	now            func() model.Time
 }
 
 // ApplyConfig updates the status state as the new config requires.
@@ -96,7 +103,18 @@ type PrometheusVersion struct {
 
 // Options for the web Handler.
 type Options struct {
+	Context       context.Context
+	Storage       local.Storage
+	QueryEngine   *promql.Engine
+	TargetManager *retrieval.TargetManager
+	RuleManager   *rules.Manager
+	Notifier      *notifier.Notifier
+	Version       *PrometheusVersion
+	Flags         map[string]string
+
 	ListenAddress        string
+	ReadTimeout          time.Duration
+	MaxConnections       int
 	ExternalURL          *url.URL
 	RoutePrefix          string
 	MetricsPath          string
@@ -108,16 +126,16 @@ type Options struct {
 }
 
 // New initializes a new web Handler.
-func New(
-	st local.Storage,
-	qe *promql.Engine,
-	tm *retrieval.TargetManager,
-	rm *rules.Manager,
-	version *PrometheusVersion,
-	flags map[string]string,
-	o *Options,
-) *Handler {
-	router := route.New()
+func New(o *Options) *Handler {
+	router := route.New(func(r *http.Request) (context.Context, error) {
+		return o.Context, nil
+	})
+
+	cwd, err := os.Getwd()
+
+	if err != nil {
+		cwd = "<error retrieving current working directory>"
+	}
 
 	h := &Handler{
 		router:      router,
@@ -125,16 +143,20 @@ func New(
 		quitCh:      make(chan struct{}),
 		reloadCh:    make(chan chan error),
 		options:     o,
-		versionInfo: version,
+		versionInfo: o.Version,
 		birth:       time.Now(),
-		flagsMap:    flags,
+		cwd:         cwd,
+		flagsMap:    o.Flags,
 
-		targetManager: tm,
-		ruleManager:   rm,
-		queryEngine:   qe,
-		storage:       st,
+		context:       o.Context,
+		targetManager: o.TargetManager,
+		ruleManager:   o.RuleManager,
+		queryEngine:   o.QueryEngine,
+		storage:       o.Storage,
+		notifier:      o.Notifier,
 
-		apiV1: api_v1.NewAPI(qe, st),
+		apiV1: api_v1.NewAPI(o.QueryEngine, o.Storage, o.TargetManager),
+		now:   model.Now,
 	}
 
 	if o.RoutePrefix != "/" {
@@ -184,6 +206,10 @@ func New(
 	}
 
 	router.Post("/-/reload", h.reload)
+	router.Get("/-/reload", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		fmt.Fprintf(w, "This endpoint requires a POST request.\n")
+	})
 
 	router.Get("/debug/*subpath", http.DefaultServeMux.ServeHTTP)
 	router.Post("/debug/*subpath", http.DefaultServeMux.ServeHTTP)
@@ -232,11 +258,18 @@ func (h *Handler) Reload() <-chan chan error {
 func (h *Handler) Run() {
 	log.Infof("Listening on %s", h.options.ListenAddress)
 	server := &http.Server{
-		Addr:     h.options.ListenAddress,
-		Handler:  h.router,
-		ErrorLog: log.NewErrorLogger(),
+		Addr:        h.options.ListenAddress,
+		Handler:     h.router,
+		ErrorLog:    log.NewErrorLogger(),
+		ReadTimeout: h.options.ReadTimeout,
 	}
-	h.listenErrCh <- server.ListenAndServe()
+	listener, err := net.Listen("tcp", h.options.ListenAddress)
+	if err != nil {
+		h.listenErrCh <- err
+	} else {
+		limitedListener := netutil.LimitListener(listener, h.options.MaxConnections)
+		h.listenErrCh <- server.Serve(limitedListener)
+	}
 }
 
 func (h *Handler) alerts(w http.ResponseWriter, r *http.Request) {
@@ -291,7 +324,7 @@ func (h *Handler) consoles(w http.ResponseWriter, r *http.Request) {
 		Path:      strings.TrimLeft(name, "/"),
 	}
 
-	tmpl := template.NewTemplateExpander(string(text), "__console_"+name, data, model.Now(), h.queryEngine, h.options.ExternalURL.Path)
+	tmpl := template.NewTemplateExpander(h.context, string(text), "__console_"+name, data, h.now(), h.queryEngine, h.options.ExternalURL.Path)
 	filenames, err := filepath.Glob(h.options.ConsoleLibrariesPath + "/*.lib")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -311,11 +344,15 @@ func (h *Handler) graph(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	h.executeTemplate(w, "status.html", struct {
-		Birth   time.Time
-		Version *PrometheusVersion
+		Birth         time.Time
+		CWD           string
+		Version       *PrometheusVersion
+		Alertmanagers []string
 	}{
-		Birth:   h.birth,
-		Version: h.versionInfo,
+		Birth:         h.birth,
+		CWD:           h.cwd,
+		Version:       h.versionInfo,
+		Alertmanagers: h.notifier.Alertmanagers(),
 	})
 }
 
@@ -335,7 +372,18 @@ func (h *Handler) rules(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) targets(w http.ResponseWriter, r *http.Request) {
-	h.executeTemplate(w, "targets.html", h.targetManager)
+	// Bucket targets by job label
+	tps := map[string][]retrieval.Target{}
+	for _, t := range h.targetManager.Targets() {
+		job := string(t.Labels()[model.JobLabel])
+		tps[job] = append(tps[job], t)
+	}
+
+	h.executeTemplate(w, "targets.html", struct {
+		TargetPools map[string][]retrieval.Target
+	}{
+		TargetPools: tps,
+	})
 }
 
 func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
@@ -464,7 +512,7 @@ func (h *Handler) executeTemplate(w http.ResponseWriter, name string, data inter
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
-	tmpl := template.NewTemplateExpander(text, name, data, model.Now(), h.queryEngine, h.options.ExternalURL.Path)
+	tmpl := template.NewTemplateExpander(h.context, text, name, data, h.now(), h.queryEngine, h.options.ExternalURL.Path)
 	tmpl.Funcs(tmplFuncs(h.consolesPath(), h.options))
 
 	result, err := tmpl.ExpandHTML(nil)

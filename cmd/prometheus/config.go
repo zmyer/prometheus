@@ -30,6 +30,7 @@ import (
 	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage/local"
+	"github.com/prometheus/prometheus/storage/local/chunk"
 	"github.com/prometheus/prometheus/storage/local/index"
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/web"
@@ -43,11 +44,13 @@ var cfg = struct {
 	printVersion bool
 	configFile   string
 
-	storage     local.MemorySeriesStorageOptions
-	notifier    notifier.Options
-	queryEngine promql.EngineOptions
-	web         web.Options
-	remote      remote.Options
+	storage            local.MemorySeriesStorageOptions
+	localStorageEngine string
+	notifier           notifier.Options
+	notifierTimeout    time.Duration
+	queryEngine        promql.EngineOptions
+	web                web.Options
+	remote             remote.Options
 
 	alertmanagerURLs stringset
 	prometheusURL    string
@@ -76,6 +79,14 @@ func init() {
 	cfg.fs.StringVar(
 		&cfg.web.ListenAddress, "web.listen-address", ":9090",
 		"Address to listen on for the web interface, API, and telemetry.",
+	)
+	cfg.fs.DurationVar(
+		&cfg.web.ReadTimeout, "web.read-timeout", 30*time.Second,
+		"Maximum duration before timing out read of the request, and closing idle connections.",
+	)
+	cfg.fs.IntVar(
+		&cfg.web.MaxConnections, "web.max-connections", 512,
+		"Maximum number of simultaneous connections.",
 	)
 	cfg.fs.StringVar(
 		&cfg.prometheusURL, "web.external-url", "",
@@ -148,7 +159,7 @@ func init() {
 		"If set, a crash recovery will perform checks on each series file. This might take a very long time.",
 	)
 	cfg.fs.Var(
-		&local.DefaultChunkEncoding, "storage.local.chunk-encoding-version",
+		&chunk.DefaultEncoding, "storage.local.chunk-encoding-version",
 		"Which chunk encoding version to use for newly created chunks. Currently supported is 0 (delta encoding), 1 (double-delta encoding), and 2 (double-delta encoding with variable bit-width).",
 	)
 	// Index cache sizes.
@@ -171,6 +182,10 @@ func init() {
 	cfg.fs.IntVar(
 		&cfg.storage.NumMutexes, "storage.local.num-fingerprint-mutexes", 4096,
 		"The number of mutexes used for fingerprint locking.",
+	)
+	cfg.fs.StringVar(
+		&cfg.localStorageEngine, "storage.local.engine", "persisted",
+		"Local storage engine. Supported values are: 'persisted' (full local storage with on-disk persistence) and 'none' (no local storage).",
 	)
 
 	// Remote storage.
@@ -206,6 +221,7 @@ func init() {
 		&cfg.remote.InfluxdbDatabase, "storage.remote.influxdb.database", "prometheus",
 		"The name of the database to use for storing samples in InfluxDB.",
 	)
+
 	cfg.fs.DurationVar(
 		&cfg.remote.StorageTimeout, "storage.remote.timeout", 30*time.Second,
 		"The timeout to use when sending samples to the remote storage.",
@@ -221,7 +237,7 @@ func init() {
 		"The capacity of the queue for pending alert manager notifications.",
 	)
 	cfg.fs.DurationVar(
-		&cfg.notifier.Timeout, "alertmanager.timeout", 10*time.Second,
+		&cfg.notifierTimeout, "alertmanager.timeout", 10*time.Second,
 		"Alert manager HTTP API timeout.",
 	)
 
@@ -255,6 +271,10 @@ func parse(args []string) error {
 		return err
 	}
 
+	if promql.StalenessDelta < 0 {
+		return fmt.Errorf("negative staleness delta: %s", promql.StalenessDelta)
+	}
+
 	if err := parsePrometheusURL(); err != nil {
 		return err
 	}
@@ -272,7 +292,6 @@ func parse(args []string) error {
 		if err := validateAlertmanagerURL(u); err != nil {
 			return err
 		}
-		cfg.notifier.AlertmanagerURLs = cfg.alertmanagerURLs.slice()
 	}
 
 	cfg.remote.InfluxdbPassword = os.Getenv("INFLUXDB_PW")

@@ -35,56 +35,46 @@ import (
 const (
 	scrapeHealthMetricName   = "up"
 	scrapeDurationMetricName = "scrape_duration_seconds"
-
-	// Constants for instrumentation.
-	namespace = "prometheus"
-	interval  = "interval"
-	scrapeJob = "scrape_job"
+	scrapeSamplesMetricName  = "scrape_samples_scraped"
 )
 
 var (
 	targetIntervalLength = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
-			Namespace:  namespace,
-			Name:       "target_interval_length_seconds",
+			Name:       "prometheus_target_interval_length_seconds",
 			Help:       "Actual intervals between scrapes.",
 			Objectives: map[float64]float64{0.01: 0.001, 0.05: 0.005, 0.5: 0.05, 0.90: 0.01, 0.99: 0.001},
 		},
-		[]string{interval},
+		[]string{"interval"},
 	)
-	targetSkippedScrapes = prometheus.NewCounterVec(
+	targetSkippedScrapes = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "target_skipped_scrapes_total",
-			Help:      "Total number of scrapes that were skipped because the metric storage was throttled.",
+			Name: "prometheus_target_skipped_scrapes_total",
+			Help: "Total number of scrapes that were skipped because the metric storage was throttled.",
 		},
-		[]string{interval},
 	)
 	targetReloadIntervalLength = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
-			Namespace:  namespace,
-			Name:       "target_reload_length_seconds",
+			Name:       "prometheus_target_reload_length_seconds",
 			Help:       "Actual interval to reload the scrape pool with a given configuration.",
 			Objectives: map[float64]float64{0.01: 0.001, 0.05: 0.005, 0.5: 0.05, 0.90: 0.01, 0.99: 0.001},
 		},
-		[]string{interval},
+		[]string{"interval"},
 	)
 	targetSyncIntervalLength = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
-			Namespace:  namespace,
-			Name:       "target_sync_length_seconds",
+			Name:       "prometheus_target_sync_length_seconds",
 			Help:       "Actual interval to sync the scrape pool.",
 			Objectives: map[float64]float64{0.01: 0.001, 0.05: 0.005, 0.5: 0.05, 0.90: 0.01, 0.99: 0.001},
 		},
-		[]string{scrapeJob},
+		[]string{"scrape_job"},
 	)
 	targetScrapePoolSyncsCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "target_scrape_pool_sync_total",
-			Help:      "Total number of syncs that were executed on a scrape pool.",
+			Name: "prometheus_target_scrape_pool_sync_total",
+			Help: "Total number of syncs that were executed on a scrape pool.",
 		},
-		[]string{scrapeJob},
+		[]string{"scrape_job"},
 	)
 )
 
@@ -114,8 +104,8 @@ type scrapePool struct {
 	newLoop func(context.Context, scraper, storage.SampleAppender, storage.SampleAppender) loop
 }
 
-func newScrapePool(cfg *config.ScrapeConfig, app storage.SampleAppender) *scrapePool {
-	client, err := newHTTPClient(cfg)
+func newScrapePool(ctx context.Context, cfg *config.ScrapeConfig, app storage.SampleAppender) *scrapePool {
+	client, err := NewHTTPClient(cfg.HTTPClientConfig)
 	if err != nil {
 		// Any errors that could occur here should be caught during config validation.
 		log.Errorf("Error creating HTTP client for job %q: %s", cfg.JobName, err)
@@ -123,18 +113,12 @@ func newScrapePool(cfg *config.ScrapeConfig, app storage.SampleAppender) *scrape
 	return &scrapePool{
 		appender: app,
 		config:   cfg,
+		ctx:      ctx,
 		client:   client,
 		targets:  map[uint64]*Target{},
 		loops:    map[uint64]loop{},
 		newLoop:  newScrapeLoop,
 	}
-}
-
-func (sp *scrapePool) init(ctx context.Context) {
-	sp.mtx.Lock()
-	defer sp.mtx.Unlock()
-
-	sp.ctx = ctx
 }
 
 // stop terminates all scrape loops and returns after they all terminated.
@@ -164,10 +148,11 @@ func (sp *scrapePool) stop() {
 // This method returns after all scrape loops that were stopped have fully terminated.
 func (sp *scrapePool) reload(cfg *config.ScrapeConfig) {
 	start := time.Now()
+
 	sp.mtx.Lock()
 	defer sp.mtx.Unlock()
 
-	client, err := newHTTPClient(cfg)
+	client, err := NewHTTPClient(cfg.HTTPClientConfig)
 	if err != nil {
 		// Any errors that could occur here should be caught during config validation.
 		log.Errorf("Error creating HTTP client for job %q: %s", cfg.JobName, err)
@@ -205,11 +190,32 @@ func (sp *scrapePool) reload(cfg *config.ScrapeConfig) {
 	)
 }
 
+// Sync converts target groups into actual scrape targets and synchronizes
+// the currently running scraper with the resulting set.
+func (sp *scrapePool) Sync(tgs []*config.TargetGroup) {
+	start := time.Now()
+
+	var all []*Target
+	for _, tg := range tgs {
+		targets, err := targetsFromGroup(tg, sp.config)
+		if err != nil {
+			log.With("err", err).Error("creating targets failed")
+			continue
+		}
+		all = append(all, targets...)
+	}
+	sp.sync(all)
+
+	targetSyncIntervalLength.WithLabelValues(sp.config.JobName).Observe(
+		time.Since(start).Seconds(),
+	)
+	targetScrapePoolSyncsCounter.WithLabelValues(sp.config.JobName).Inc()
+}
+
 // sync takes a list of potentially duplicated targets, deduplicates them, starts
 // scrape loops for new targets, and stops scrape loops for disappeared targets.
 // It returns after all stopped scrape loops terminated.
 func (sp *scrapePool) sync(targets []*Target) {
-	start := time.Now()
 	sp.mtx.Lock()
 	defer sp.mtx.Unlock()
 
@@ -255,10 +261,6 @@ func (sp *scrapePool) sync(targets []*Target) {
 	// may be active and tries to insert. The old scraper that didn't terminate yet could still
 	// be inserting a previous sample set.
 	wg.Wait()
-	targetSyncIntervalLength.WithLabelValues(sp.config.JobName).Observe(
-		time.Since(start).Seconds(),
-	)
-	targetScrapePoolSyncsCounter.WithLabelValues(sp.config.JobName).Inc()
 }
 
 // sampleAppender returns an appender for ingested samples from the target.
@@ -308,7 +310,7 @@ type targetScraper struct {
 	client *http.Client
 }
 
-const acceptHeader = `application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.7,text/plain;version=0.0.4;q=0.3,application/json;schema="prometheus/telemetry";version=0.0.2;q=0.2,*/*;q=0.1`
+const acceptHeader = `application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.7,text/plain;version=0.0.4;q=0.3,*/*;q=0.1`
 
 func (s *targetScraper) scrape(ctx context.Context, ts time.Time) (model.Samples, error) {
 	req, err := http.NewRequest("GET", s.URL().String(), nil)
@@ -424,10 +426,10 @@ func (sl *scrapeLoop) run(interval, timeout time.Duration, errc chan<- error) {
 				errc <- err
 			}
 
-			sl.report(start, time.Since(start), err)
+			sl.report(start, time.Since(start), len(samples), err)
 			last = start
 		} else {
-			targetSkippedScrapes.WithLabelValues(interval.String()).Inc()
+			targetSkippedScrapes.Inc()
 		}
 
 		select {
@@ -471,7 +473,7 @@ func (sl *scrapeLoop) append(samples model.Samples) {
 	}
 }
 
-func (sl *scrapeLoop) report(start time.Time, duration time.Duration, err error) {
+func (sl *scrapeLoop) report(start time.Time, duration time.Duration, scrapedSamples int, err error) {
 	sl.scraper.report(start, duration, err)
 
 	ts := model.TimeFromUnixNano(start.UnixNano())
@@ -495,11 +497,21 @@ func (sl *scrapeLoop) report(start time.Time, duration time.Duration, err error)
 		Timestamp: ts,
 		Value:     model.SampleValue(duration.Seconds()),
 	}
+	countSample := &model.Sample{
+		Metric: model.Metric{
+			model.MetricNameLabel: scrapeSamplesMetricName,
+		},
+		Timestamp: ts,
+		Value:     model.SampleValue(scrapedSamples),
+	}
 
 	if err := sl.reportAppender.Append(healthSample); err != nil {
 		log.With("sample", healthSample).With("error", err).Warn("Scrape health sample discarded")
 	}
 	if err := sl.reportAppender.Append(durationSample); err != nil {
 		log.With("sample", durationSample).With("error", err).Warn("Scrape duration sample discarded")
+	}
+	if err := sl.reportAppender.Append(countSample); err != nil {
+		log.With("sample", durationSample).With("error", err).Warn("Scrape sample count sample discarded")
 	}
 }

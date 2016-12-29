@@ -36,7 +36,7 @@ func TestNewScrapePool(t *testing.T) {
 	var (
 		app = &nopAppender{}
 		cfg = &config.ScrapeConfig{}
-		sp  = newScrapePool(cfg, app)
+		sp  = newScrapePool(context.Background(), cfg, app)
 	)
 
 	if a, ok := sp.appender.(*nopAppender); !ok || a != app {
@@ -137,7 +137,7 @@ func TestScrapePoolReload(t *testing.T) {
 		ScrapeInterval: model.Duration(3 * time.Second),
 		ScrapeTimeout:  model.Duration(2 * time.Second),
 	}
-	// On starting to run, new loops created on reload check whether their preceeding
+	// On starting to run, new loops created on reload check whether their preceding
 	// equivalents have been stopped.
 	newLoop := func(ctx context.Context, s scraper, app, reportApp storage.SampleAppender) loop {
 		l := &testLoop{}
@@ -163,7 +163,7 @@ func TestScrapePoolReload(t *testing.T) {
 	}
 
 	// Reloading a scrape pool with a new scrape configuration must stop all scrape
-	// loops and start new ones. A new loop must not be started before the preceeding
+	// loops and start new ones. A new loop must not be started before the preceding
 	// one terminated.
 
 	for i := 0; i < numTargets; i++ {
@@ -231,7 +231,7 @@ func TestScrapePoolReportAppender(t *testing.T) {
 	target := newTestTarget("example.com:80", 10*time.Millisecond, nil)
 	app := &nopAppender{}
 
-	sp := newScrapePool(cfg, app)
+	sp := newScrapePool(context.Background(), cfg, app)
 
 	cfg.HonorLabels = false
 	wrapped := sp.reportAppender(target)
@@ -266,7 +266,7 @@ func TestScrapePoolSampleAppender(t *testing.T) {
 	target := newTestTarget("example.com:80", 10*time.Millisecond, nil)
 	app := &nopAppender{}
 
-	sp := newScrapePool(cfg, app)
+	sp := newScrapePool(context.Background(), cfg, app)
 
 	cfg.HonorLabels = false
 	wrapped := sp.sampleAppender(target)
@@ -506,7 +506,7 @@ func TestTargetScrapeScrapeCancel(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 
-	done := make(chan struct{})
+	errc := make(chan error)
 
 	go func() {
 		time.Sleep(1 * time.Second)
@@ -515,15 +515,18 @@ func TestTargetScrapeScrapeCancel(t *testing.T) {
 
 	go func() {
 		if _, err := ts.scrape(ctx, time.Now()); err != context.Canceled {
-			t.Fatalf("Expected context cancelation error but got: %s", err)
+			errc <- fmt.Errorf("Expected context cancelation error but got: %s", err)
 		}
-		close(done)
+		close(errc)
 	}()
 
 	select {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("Scrape function did not return unexpectedly")
-	case <-done:
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf(err.Error())
+		}
 	}
 	// If this is closed in a defer above the function the test server
 	// does not terminate and the test doens't complete.
